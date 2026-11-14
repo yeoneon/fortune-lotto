@@ -887,3 +887,138 @@ export const getDailyFortune = onCall(
     return {daily, weekly};
   },
 );
+
+// ---- 띠별 오늘의 운세 (사주 미등록자용) ----
+//
+// 사주를 등록하지 않은 사람에게도 또신 탭에서 볼 거리를 주기 위해, 12띠의
+// 오늘 한 줄 운세를 날짜당 한 번만 만들어 모든 사용자가 공유한다(캐시).
+// 개인 정보가 들어가지 않는다.
+
+const ZODIAC_KEYS = [
+  "rat", "ox", "tiger", "rabbit", "dragon", "snake",
+  "horse", "goat", "monkey", "rooster", "dog", "pig",
+] as const;
+type ZodiacKey = typeof ZODIAC_KEYS[number];
+
+const ZODIAC_MAX_TEXT_LENGTH = 70;
+const ZODIAC_GENERATION_CONFIG: CompletionConfig = {maxOutputTokens: 1600};
+const DEFAULT_ZODIAC_LINE =
+  "무리하지 않고 하던 일을 차분히 이어가면 편안한 하루입니다.";
+
+interface ZodiacFortunePayload {
+  date: string;
+  dayPillar: string;
+  lines: Record<ZodiacKey, string>;
+}
+
+/**
+ * 띠별 오늘의 운세 프롬프트를 만든다.
+ * @param {string} dateKey KST 기준 오늘 날짜.
+ * @param {string} dayPillar 오늘의 일진(없으면 빈 문자열).
+ * @return {{systemPrompt: string, userPrompt: string}} 프롬프트 쌍.
+ */
+const buildZodiacPrompts = (
+  dateKey: string,
+  dayPillar: string,
+): {systemPrompt: string; userPrompt: string} => {
+  const systemPrompt = `
+    너는 '또신', 운세를 봐주는 신이다.
+    항상 공손한 존댓말만 사용하라. 예스러운 말투나 반말은 쓰지 마라.
+    [규칙]
+    - 12띠 각각의 오늘 하루 운세를 한 문장으로 써라.
+    - 오늘의 일진이 주어지면 그 일진의 지지와 각 띠(지지)의 관계(합·충·형 등)를
+      근거로 띠마다 다르게 써라. 서로 비슷한 문장을 반복하지 마라.
+    - 일·돈·사람 관계 중심으로, 오늘 무엇을 하면 좋을지 구체적으로 써라.
+    - 로또·번호·당첨은 언급하지 마라.
+    - 건강·죽음·투자수익을 단정하지 마라. 완곡하게 표현하라.
+    - 출력은 JSON 객체만 허용한다(설명/코드블록 금지).
+    [출력 키] ${ZODIAC_KEYS.join(", ")}
+    (각각 문자열, ${ZODIAC_MAX_TEXT_LENGTH}자 이내.
+    rat=쥐, ox=소, tiger=호랑이, rabbit=토끼, dragon=용, snake=뱀,
+    horse=말, goat=양, monkey=원숭이, rooster=닭, dog=개, pig=돼지)`;
+
+  const userPrompt = `
+    오늘 날짜(KST): ${dateKey}
+    오늘의 일진: ${dayPillar || "정보 없음"}
+
+    반드시 JSON 객체만 반환하라.`;
+
+  return {systemPrompt, userPrompt};
+};
+
+/**
+ * 띠별 오늘의 운세를 생성한다. 실패 시 기본 문구로 채우고 캐시하지 않는다.
+ * @param {!OpenAI} client OpenAI 클라이언트.
+ * @param {string} dateKey KST 기준 오늘 날짜.
+ * @param {string} dayPillar 오늘의 일진(없으면 빈 문자열).
+ * @return {!Promise<{payload: !ZodiacFortunePayload, isFallback: boolean}>}
+ *     생성된 띠별 운세와 폴백 여부.
+ */
+const createZodiacPayload = async (
+  client: OpenAI,
+  dateKey: string,
+  dayPillar: string,
+): Promise<{payload: ZodiacFortunePayload; isFallback: boolean}> => {
+  const fallbackLines = Object.fromEntries(
+    ZODIAC_KEYS.map((key) => [key, DEFAULT_ZODIAC_LINE]),
+  ) as Record<ZodiacKey, string>;
+
+  try {
+    const {systemPrompt, userPrompt} = buildZodiacPrompts(dateKey, dayPillar);
+    const {text, usage} = await generateJson(
+      client, ZODIAC_GENERATION_CONFIG, systemPrompt, userPrompt,
+    );
+    functions.logger.info("getZodiacFortune token usage", {
+      code: "ZODIAC_FORTUNE_TOKEN_USAGE",
+      usage,
+    });
+    const parsed = parseJsonResponse(text.trim());
+    const data = isRecord(parsed) ? parsed : {};
+    const lines = Object.fromEntries(
+      ZODIAC_KEYS.map((key) => [
+        key,
+        normalizeText(data[key], DEFAULT_ZODIAC_LINE, ZODIAC_MAX_TEXT_LENGTH),
+      ]),
+    ) as Record<ZodiacKey, string>;
+    return {isFallback: false, payload: {date: dateKey, dayPillar, lines}};
+  } catch (error) {
+    functions.logger.warn("getZodiacFortune text fallback", {
+      code: "ZODIAC_FORTUNE_TEXT_FALLBACK",
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {
+      isFallback: true,
+      payload: {date: dateKey, dayPillar, lines: fallbackLines},
+    };
+  }
+};
+
+export const getZodiacFortune = onCall(
+  {region: "asia-northeast3"},
+  async (request): Promise<ZodiacFortunePayload> => {
+    const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+    if (!OPENAI_API_KEY) {
+      throw new functions.https.HttpsError(
+        "internal", "OPENAI_API_KEY is not set.",
+      );
+    }
+    if (!openai) {
+      openai = new OpenAI({apiKey: OPENAI_API_KEY});
+    }
+
+    const dateKey = getKstDateKey(new Date());
+    const ref = db().collection("zodiacFortune").doc(dateKey);
+    const snapshot = await ref.get();
+    if (snapshot.exists) return snapshot.data() as ZodiacFortunePayload;
+
+    const data = request.data as {dayPillar?: unknown} | undefined;
+    const dayPillar = sanitizeDayPillar(data?.dayPillar);
+    const {payload, isFallback} = await createZodiacPayload(
+      openai, dateKey, dayPillar,
+    );
+    if (!isFallback) {
+      await ref.set(payload);
+    }
+    return payload;
+  },
+);
