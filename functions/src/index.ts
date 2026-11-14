@@ -1391,5 +1391,7 @@ export const fortuneLotto = onCall(
 // 신규 함수(별도 파일, 기존 fortuneLotto와 무관). 배포/호환성 제약:
 // docs/ai-ddoshin/README.md, docs/ai-ddoshin/02-backend.md 참고 — 기존 함수는
 // 절대 수정하지 않고, 이렇게 export만 추가한다.
-export {getDailyFortune, getZodiacFortune} from "./dailyFortune";
+export {
+  getDailyFortune, getZodiacFortune, prewarmFortunes,
+} from "./dailyFortune";
 export {chatWithTtoGod} from "./chatWithTtoGod";

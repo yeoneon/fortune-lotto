@@ -1,4 +1,5 @@
 import {onCall} from "firebase-functions/v2/https";
+import {onSchedule} from "firebase-functions/v2/scheduler";
 import * as functions from "firebase-functions";
 import * as admin from "firebase-admin";
 import OpenAI from "openai";
@@ -17,7 +18,18 @@ if (admin.apps.length === 0) {
   admin.initializeApp();
 }
 
-let openai: OpenAI | null = null;
+let cachedOpenAi: OpenAI | null = null;
+
+/**
+ * 인스턴스당 하나의 OpenAI 클라이언트를 돌려준다.
+ * @return {?OpenAI} 키가 없으면 null.
+ */
+const openAiClient = (): OpenAI | null => {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) return null;
+  cachedOpenAi ??= new OpenAI({apiKey});
+  return cachedOpenAi;
+};
 
 // 명시 버전 핀(latest 별칭 금지). 단가: 입력 $0.20 / 출력 $1.20 per M 토큰.
 const OPENAI_MODEL_ID = "gpt-5.6-luna";
@@ -127,6 +139,9 @@ interface DailyFortunePayload {
   luckyNumbers: number[];
   numberRationale: string;
   lucky: {color: string; direction: string; time: string; food: string};
+  // 오늘의 질문과 그 답의 첫 문장(2026-11-15 추가).
+  question: string;
+  questionTeaser: string;
 }
 
 interface WeeklyFortunePayload {
@@ -385,6 +400,32 @@ const sanitizeDayPillar = (value: unknown): string => {
   return text.length > 0 && text.length <= 12 ? text : "";
 };
 
+const STEMS_KO = "갑을병정무기경신임계";
+const STEMS_HANJA = "甲乙丙丁戊己庚辛壬癸";
+const BRANCHES_KO = "자축인묘진사오미신유술해";
+const BRANCHES_HANJA = "子丑寅卯辰巳午未申酉戌亥";
+// 2026-11-14 = 임진(壬辰)일 = 60갑자 28번째(0부터).
+const DAY_PILLAR_BASE_UTC = Date.UTC(2026, 10, 14);
+const DAY_PILLAR_BASE_INDEX = 28;
+
+/**
+ * 날짜의 일진을 앱(ManseCalculator.dayPillarOf)과 같은 형식으로 구한다.
+ * 예약 생성처럼 앱이 일진을 보내주지 않을 때 쓴다.
+ * @param {string} dateKey yyyy-mm-dd.
+ * @return {string} 예: "임진(壬辰)".
+ */
+const dayPillarOf = (dateKey: string): string => {
+  const [y, m, d] = dateKey.split("-").map(Number);
+  const days = Math.round(
+    (Date.UTC(y, m - 1, d) - DAY_PILLAR_BASE_UTC) / 86400000,
+  );
+  const index = (((DAY_PILLAR_BASE_INDEX + days) % 60) + 60) % 60;
+  const stem = index % 10;
+  const branch = index % 12;
+  return `${STEMS_KO[stem]}${BRANCHES_KO[branch]}` +
+    `(${STEMS_HANJA[stem]}${BRANCHES_HANJA[branch]})`;
+};
+
 // ---- Firestore 캐시 ----
 
 const db = (): admin.firestore.Firestore => admin.firestore();
@@ -496,6 +537,69 @@ const ELEMENT_KOREAN: Record<string, string> = {
   wood: "목", fire: "화", earth: "토", metal: "금", water: "수",
 };
 
+// ---- 오늘의 질문 ----
+//
+// 또신 탭의 "오늘의 질문" 카드. 날짜마다 하나를 골라 모든 사용자에게 같은
+// 질문을 보여주고, 답의 첫 문장(teaser)만 운세 생성 때 함께 만들어 둔다.
+// 카드를 누르면 채팅이 이 첫 문장으로 답을 이어간다(chatWithTtoGod).
+// 3050 관심사(재물·직장·사업·사람) 중심.
+const TODAY_QUESTIONS = [
+  "오늘 큰돈 써도 될까요?",
+  "이번 달 돈이 새는 곳이 어디일까요?",
+  "요즘 들어오는 돈이 왜 이렇게 빨리 나갈까요?",
+  "목돈이 생기면 어디에 먼저 써야 할까요?",
+  "지인이 돈을 빌려 달라는데 빌려줘도 될까요?",
+  "부업을 시작해도 괜찮을까요?",
+  "올해 안에 재물운이 트일까요?",
+  "충동구매를 줄이려면 어떻게 해야 할까요?",
+  "상사와 부딪히지 않으려면 오늘 뭘 조심할까요?",
+  "지금 이직을 알아봐도 될까요?",
+  "회사에서 인정받으려면 뭘 해야 할까요?",
+  "요즘 일이 손에 안 잡히는데 왜 그럴까요?",
+  "승진이나 연봉 협상, 지금 말해도 될까요?",
+  "동료와 사이가 껄끄러운데 어떻게 풀까요?",
+  "퇴사하고 싶은 마음, 참아야 할까요?",
+  "오늘 중요한 미팅, 어떻게 풀어야 할까요?",
+  "새로운 일을 벌여도 되는 시기일까요?",
+  "장사가 잘되려면 뭘 바꿔야 할까요?",
+  "동업 제안, 받아들여도 될까요?",
+  "계약서에 도장 찍기 전에 뭘 봐야 할까요?",
+  "매출이 정체됐는데 돌파구가 있을까요?",
+  "오늘 조심해야 할 사람은 누구일까요?",
+  "가족과 돈 문제로 다투지 않으려면요?",
+  "요즘 사람들한테 지치는데 어떻게 할까요?",
+  "도움을 청하면 들어줄 사람이 있을까요?",
+  "배우자와 돈 이야기를 꺼내도 될까요?",
+  "오늘 하루, 가장 신경 써야 할 건 뭘까요?",
+  "요즘 마음이 불안한데 괜찮아질까요?",
+  "이번 주말을 어떻게 보내면 운이 좋을까요?",
+  "올해 남은 기간, 무엇에 집중해야 할까요?",
+];
+const QUESTION_TEASER_MAX_LENGTH = 60;
+const DEFAULT_QUESTION_TEASER =
+  "오늘은 서두르기보다 한 번만 더 살펴보시면 길이 보입니다.";
+
+/**
+ * 날짜별 오늘의 질문. 같은 날은 모두 같은 질문이다.
+ * @param {string} dateKey KST 기준 날짜.
+ * @return {string} 질문 문구.
+ */
+const todayQuestionOf = (dateKey: string): string =>
+  TODAY_QUESTIONS[
+    hashStringToUint32(`question|${dateKey}`) % TODAY_QUESTIONS.length
+  ];
+
+/**
+ * 오늘의 질문 답 첫 문장을 쓰게 하는 프롬프트 규칙.
+ * @param {string} key 출력 JSON 키.
+ * @param {string} question 오늘의 질문.
+ * @return {string} 시스템 프롬프트에 넣을 규칙 한 줄.
+ */
+const teaserRule = (key: string, question: string): string =>
+  `- ${key}는 오늘의 질문 "${question}"에 대한 답의 첫 문장이다. ` +
+  "결론의 실마리만 주고 이유와 방법은 말하지 말아, 뒤가 궁금해지게 " +
+  `써라. ${QUESTION_TEASER_MAX_LENGTH}자 이내.`;
+
 /**
  * 데일리 운세 프롬프트(오늘의 한줄운세/총평/번호서사/행운아이템)를 만든다.
  * @param {!ManseData} manse 만세력 데이터.
@@ -504,6 +608,7 @@ const ELEMENT_KOREAN: Record<string, string> = {
  * @param {string} dateKey KST 기준 오늘 날짜.
  * @param {string} dayPillar 오늘의 일진(없으면 빈 문자열).
  * @param {!DailyScores} scores 서버가 확정한 분야별 점수.
+ * @param {string} question 오늘의 질문.
  * @return {{systemPrompt: string, userPrompt: string}} 프롬프트 쌍.
  */
 const buildDailyPrompts = (
@@ -513,6 +618,7 @@ const buildDailyPrompts = (
   dateKey: string,
   dayPillar: string,
   scores: DailyScores,
+  question: string,
 ): {systemPrompt: string; userPrompt: string} => {
   const deficientText = deficient
     .map((e) => ELEMENT_KOREAN[e] ?? e)
@@ -537,9 +643,11 @@ const buildDailyPrompts = (
       numberRationale에서 왜 이 번호인지 사주 근거로 설명하라.
     - 오늘의 행운 아이템(색·방향·시간대·음식)을 각각 하나씩,
       구체적으로 제시하라.
+    ${teaserRule("questionTeaser", question)}
     - 건강·죽음·투자수익을 단정하지 마라. 공손체로 완곡히 표현하라.
     - 출력은 JSON 객체만 허용한다(설명/코드블록 금지).
     [출력 키] oneLine(문자열,${MAX_TEXT_LENGTH}자 이내),
+    questionTeaser(문자열),
     summary(문자열,${SUMMARY_MAX_TEXT_LENGTH}자 이내),
     numberRationale(문자열,${MAX_TEXT_LENGTH}자 이내),
     lucky{color,direction,time,food}(각각 짧은 문자열)`;
@@ -620,6 +728,9 @@ const generateJson = async (
   const result = await client.chat.completions.create({
     model: OPENAI_MODEL_ID,
     max_completion_tokens: config.maxOutputTokens,
+    // 짧은 운세 문구라 깊은 추론이 필요 없다. 생각 토큰(관측 80~400)이
+    // 응답 대기 시간 대부분을 차지해서 낮춘다.
+    reasoning_effort: "low",
     response_format: {type: "json_object"},
     messages: [
       {role: "system", content: systemPrompt},
@@ -668,10 +779,11 @@ const createDailyPayload = async (
   const scores = generateDailyScores(sajuHash, dateKey);
   const luckyNumbers = generateLottoNumbers(manse, sajuHash, dateKey);
   const deficient = deficientElements(manse.fiveElements);
+  const question = todayQuestionOf(dateKey);
 
   try {
     const {systemPrompt, userPrompt} = buildDailyPrompts(
-      manse, luckyNumbers, deficient, dateKey, dayPillar, scores,
+      manse, luckyNumbers, deficient, dateKey, dayPillar, scores, question,
     );
     const {text, usage} = await generateJson(
       client, DAILY_GENERATION_CONFIG, systemPrompt, userPrompt,
@@ -706,6 +818,11 @@ const createDailyPayload = async (
           time: normalizeText(luckyRaw.time, DEFAULT_LUCKY.time),
           food: normalizeText(luckyRaw.food, DEFAULT_LUCKY.food),
         },
+        question,
+        questionTeaser: normalizeText(
+          data.questionTeaser, DEFAULT_QUESTION_TEASER,
+          QUESTION_TEASER_MAX_LENGTH,
+        ),
       },
     };
   } catch (error) {
@@ -724,6 +841,8 @@ const createDailyPayload = async (
         scores,
         numberRationale: DEFAULT_NUMBER_RATIONALE,
         lucky: DEFAULT_LUCKY,
+        question,
+        questionTeaser: DEFAULT_QUESTION_TEASER,
       },
     };
   }
@@ -800,8 +919,8 @@ const getOrCreateDaily = async (
   dayPillar: string,
 ): Promise<DailyFortunePayload> => {
   const cached = await getCachedDaily(sajuHash, dateKey);
-  // 총평(summary)이 생기기 전에 저장된 캐시는 다시 만든다(그날 한 번).
-  if (cached?.summary) return cached;
+  // 총평·오늘의 질문이 생기기 전에 저장된 캐시는 다시 만든다(그날 한 번).
+  if (cached?.summary && cached.questionTeaser) return cached;
 
   const {payload, isFallback} = await createDailyPayload(
     client, manse, dateKey, dayPillar,
@@ -839,6 +958,43 @@ const getOrCreateWeekly = async (
   return payload;
 };
 
+// ---- 예약 생성(prewarmFortunes)용 사주 기록 ----
+//
+// 최근 운세를 본 사주를 기억해 두고, 매일 0시에 그날 운세를 미리 만들어
+// 둔다(앱에서 열 때 AI 생성을 기다리지 않게). 이름·생년월일 요약은
+// 프롬프트에 쓰이지 않으므로 지우고 저장한다.
+const PREWARM_COLLECTION = "fortunePrewarm";
+const PREWARM_ACTIVE_DAYS = 7;
+const PREWARM_CONCURRENCY = 10;
+
+/**
+ * 이 사주를 예약 생성 대상으로 기록한다(마지막으로 본 날짜 갱신).
+ * 실패해도 운세 응답에는 영향을 주지 않는다.
+ * @param {!ManseData} manse 만세력 데이터.
+ * @param {string} sajuHash 사주 식별 해시.
+ * @param {string} dateKey KST 기준 오늘 날짜.
+ * @return {!Promise<void>} 기록 완료 시 resolve.
+ */
+const rememberForPrewarm = async (
+  manse: ManseData,
+  sajuHash: string,
+  dateKey: string,
+): Promise<void> => {
+  try {
+    await db().collection(PREWARM_COLLECTION).doc(sajuHash).set({
+      manse: {
+        ...manse,
+        profile: {...manse.profile, displayName: "", birthSummary: ""},
+      },
+      lastSeen: dateKey,
+    });
+  } catch (error) {
+    functions.logger.warn("prewarm record failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+};
+
 /**
  * 요청으로 들어온 값이 최소한의 만세력 형태를 갖췄는지 검사한다.
  * @param {unknown} value 검사할 값.
@@ -854,14 +1010,11 @@ const isManseLike = (value: unknown): value is ManseData => {
 export const getDailyFortune = onCall(
   {region: "asia-northeast3"},
   async (request): Promise<GetDailyFortuneResponse> => {
-    const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-    if (!OPENAI_API_KEY) {
+    const openai = openAiClient();
+    if (!openai) {
       throw new functions.https.HttpsError(
         "internal", "OPENAI_API_KEY is not set.",
       );
-    }
-    if (!openai) {
-      openai = new OpenAI({apiKey: OPENAI_API_KEY});
     }
 
     const {manse, today} = request.data as GetDailyFortuneRequest;
@@ -882,6 +1035,7 @@ export const getDailyFortune = onCall(
     const [daily, weekly] = await Promise.all([
       getOrCreateDaily(openai, manse, sajuHash, dateKey, dayPillar),
       getOrCreateWeekly(openai, manse, sajuHash, isoWeek),
+      rememberForPrewarm(manse, sajuHash, dateKey),
     ]);
 
     return {daily, weekly};
@@ -905,34 +1059,69 @@ const ZODIAC_GENERATION_CONFIG: CompletionConfig = {maxOutputTokens: 1600};
 const DEFAULT_ZODIAC_LINE =
   "무리하지 않고 하던 일을 차분히 이어가면 편안한 하루입니다.";
 
+// 2026-11-14: 미등록자 화면에 공통 "오늘의 운세"(총평·별점)를 함께 보여주며
+// 같은 호출에서 만든다. 별점은 개인 운세처럼 서버가 결정론으로 정한다.
+interface CommonTodayFortune {
+  summary: string;
+  scores: DailyScores;
+  question: string;
+  questionTeaser: string;
+}
+
 interface ZodiacFortunePayload {
   date: string;
   dayPillar: string;
   lines: Record<ZodiacKey, string>;
+  today: CommonTodayFortune;
 }
 
+// 미등록자용 공통 이번 주 운세. 주당 한 번 만들어 공유한다.
+interface CommonWeeklyFortune {
+  isoWeek: string;
+  money: string;
+  business: string;
+  health: string;
+  job: string;
+}
+
+const COMMON_WEEKLY_KEYS = ["money", "business", "health", "job"] as const;
+const COMMON_WEEKLY_MAX_TEXT_LENGTH = 160;
+const COMMON_WEEKLY_GENERATION_CONFIG: CompletionConfig = {
+  maxOutputTokens: 1200,
+};
+
 /**
- * 띠별 오늘의 운세 프롬프트를 만든다.
+ * 띠별·공통 오늘의 운세 프롬프트를 만든다.
  * @param {string} dateKey KST 기준 오늘 날짜.
  * @param {string} dayPillar 오늘의 일진(없으면 빈 문자열).
+ * @param {!DailyScores} scores 서버가 확정한 공통 분야별 점수.
+ * @param {string} question 오늘의 질문.
  * @return {{systemPrompt: string, userPrompt: string}} 프롬프트 쌍.
  */
 const buildZodiacPrompts = (
   dateKey: string,
   dayPillar: string,
+  scores: DailyScores,
+  question: string,
 ): {systemPrompt: string; userPrompt: string} => {
   const systemPrompt = `
     너는 '또신', 운세를 봐주는 신이다.
     항상 공손한 존댓말만 사용하라. 예스러운 말투나 반말은 쓰지 마라.
     [규칙]
+    - common은 모든 사람에게 같은 오늘의 총평 2~3문장이다. 오늘의 일진이
+      가진 기운을 근거로 쓰고, 주어진 분야별 점수(재물·직장·사람, 5점 만점)와
+      어긋나지 않게 써라.
     - 12띠 각각의 오늘 하루 운세를 한 문장으로 써라.
     - 오늘의 일진이 주어지면 그 일진의 지지와 각 띠(지지)의 관계(합·충·형 등)를
       근거로 띠마다 다르게 써라. 서로 비슷한 문장을 반복하지 마라.
     - 일·돈·사람 관계 중심으로, 오늘 무엇을 하면 좋을지 구체적으로 써라.
     - 로또·번호·당첨은 언급하지 마라.
+    ${teaserRule("commonTeaser", question)} 모두에게 같은 답이다.
     - 건강·죽음·투자수익을 단정하지 마라. 완곡하게 표현하라.
     - 출력은 JSON 객체만 허용한다(설명/코드블록 금지).
-    [출력 키] ${ZODIAC_KEYS.join(", ")}
+    [출력 키] common(문자열, ${SUMMARY_MAX_TEXT_LENGTH}자 이내),
+    commonTeaser(문자열),
+    ${ZODIAC_KEYS.join(", ")}
     (각각 문자열, ${ZODIAC_MAX_TEXT_LENGTH}자 이내.
     rat=쥐, ox=소, tiger=호랑이, rabbit=토끼, dragon=용, snake=뱀,
     horse=말, goat=양, monkey=원숭이, rooster=닭, dog=개, pig=돼지)`;
@@ -940,10 +1129,98 @@ const buildZodiacPrompts = (
   const userPrompt = `
     오늘 날짜(KST): ${dateKey}
     오늘의 일진: ${dayPillar || "정보 없음"}
+    분야별 점수(5점 만점): 재물 ${scores.money}, 직장 ${scores.work}, 사람 ${scores.people}
 
     반드시 JSON 객체만 반환하라.`;
 
   return {systemPrompt, userPrompt};
+};
+
+/**
+ * 미등록자용 공통 이번 주 운세 프롬프트를 만든다.
+ * @param {string} isoWeek ISO 8601 주차.
+ * @return {{systemPrompt: string, userPrompt: string}} 프롬프트 쌍.
+ */
+const buildCommonWeeklyPrompts = (
+  isoWeek: string,
+): {systemPrompt: string; userPrompt: string} => {
+  const systemPrompt = `
+    너는 '또신', 운세를 봐주는 신이다.
+    항상 공손한 존댓말만 사용하라. 예스러운 말투나 반말은 쓰지 마라.
+    [규칙]
+    - 모든 사람에게 같은 이번 주 재물운·사업운·건강운·직업운을 각각 2~3문장으로
+      써라. 이번 주에 있을 법한 상황 하나와 실천할 조언 하나를 꼭 넣어라.
+    - 개인 사주를 모르는 공통 운세이므로 "사주를 등록하면 더 정확해진다"는
+      말은 쓰지 마라(화면이 따로 안내한다).
+    - 로또·번호·당첨은 언급하지 마라.
+    - 건강·죽음·투자수익을 단정하지 마라. 완곡하게 표현하라.
+    - 출력은 JSON 객체만 허용한다(설명/코드블록 금지).
+    [출력 키] ${COMMON_WEEKLY_KEYS.join(", ")}
+    (각각 문자열, ${COMMON_WEEKLY_MAX_TEXT_LENGTH}자 이내)`;
+
+  const userPrompt = `
+    이번 주(ISO 주차, KST): ${isoWeek}
+
+    반드시 JSON 객체만 반환하라.`;
+
+  return {systemPrompt, userPrompt};
+};
+
+/**
+ * 공통 이번 주 운세를 캐시에서 꺼내거나, 없으면 만들어 저장한다.
+ * 생성에 실패하면 기본 문구로 채우고 저장하지 않는다.
+ * @param {!OpenAI} client OpenAI 클라이언트.
+ * @param {string} isoWeek ISO 8601 주차.
+ * @return {!Promise<!CommonWeeklyFortune>} 공통 이번 주 운세.
+ */
+const getOrCreateCommonWeekly = async (
+  client: OpenAI,
+  isoWeek: string,
+): Promise<CommonWeeklyFortune> => {
+  const ref = db().collection("commonWeeklyFortune").doc(isoWeek);
+  const snapshot = await ref.get();
+  if (snapshot.exists) return snapshot.data() as CommonWeeklyFortune;
+
+  const fallback: CommonWeeklyFortune = {
+    isoWeek,
+    money: DEFAULT_WEEKLY.money,
+    business: DEFAULT_WEEKLY.business,
+    health: DEFAULT_WEEKLY.health,
+    job: DEFAULT_WEEKLY.job,
+  };
+  try {
+    const {systemPrompt, userPrompt} = buildCommonWeeklyPrompts(isoWeek);
+    const {text, usage} = await generateJson(
+      client, COMMON_WEEKLY_GENERATION_CONFIG, systemPrompt, userPrompt,
+    );
+    functions.logger.info("getZodiacFortune common weekly token usage", {
+      code: "COMMON_WEEKLY_FORTUNE_TOKEN_USAGE",
+      usage,
+    });
+    const parsed = parseJsonResponse(text.trim());
+    const data = isRecord(parsed) ? parsed : {};
+    const payload: CommonWeeklyFortune = {
+      isoWeek,
+      money: normalizeText(
+        data.money, fallback.money, COMMON_WEEKLY_MAX_TEXT_LENGTH,
+      ),
+      business: normalizeText(
+        data.business, fallback.business, COMMON_WEEKLY_MAX_TEXT_LENGTH,
+      ),
+      health: normalizeText(
+        data.health, fallback.health, COMMON_WEEKLY_MAX_TEXT_LENGTH,
+      ),
+      job: normalizeText(data.job, fallback.job, COMMON_WEEKLY_MAX_TEXT_LENGTH),
+    };
+    await ref.set(payload);
+    return payload;
+  } catch (error) {
+    functions.logger.warn("getZodiacFortune common weekly fallback", {
+      code: "COMMON_WEEKLY_FORTUNE_TEXT_FALLBACK",
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return fallback;
+  }
 };
 
 /**
@@ -962,9 +1239,14 @@ const createZodiacPayload = async (
   const fallbackLines = Object.fromEntries(
     ZODIAC_KEYS.map((key) => [key, DEFAULT_ZODIAC_LINE]),
   ) as Record<ZodiacKey, string>;
+  // 개인 운세의 sajuHash 자리에 고정 문자열을 넣어 날짜만으로 정해지게 한다.
+  const scores = generateDailyScores("common", dateKey);
+  const question = todayQuestionOf(dateKey);
 
   try {
-    const {systemPrompt, userPrompt} = buildZodiacPrompts(dateKey, dayPillar);
+    const {systemPrompt, userPrompt} = buildZodiacPrompts(
+      dateKey, dayPillar, scores, question,
+    );
     const {text, usage} = await generateJson(
       client, ZODIAC_GENERATION_CONFIG, systemPrompt, userPrompt,
     );
@@ -980,7 +1262,21 @@ const createZodiacPayload = async (
         normalizeText(data[key], DEFAULT_ZODIAC_LINE, ZODIAC_MAX_TEXT_LENGTH),
       ]),
     ) as Record<ZodiacKey, string>;
-    return {isFallback: false, payload: {date: dateKey, dayPillar, lines}};
+    const today = {
+      summary: normalizeText(
+        data.common, DEFAULT_SUMMARY, SUMMARY_MAX_TEXT_LENGTH,
+      ),
+      scores,
+      question,
+      questionTeaser: normalizeText(
+        data.commonTeaser, DEFAULT_QUESTION_TEASER,
+        QUESTION_TEASER_MAX_LENGTH,
+      ),
+    };
+    return {
+      isFallback: false,
+      payload: {date: dateKey, dayPillar, lines, today},
+    };
   } catch (error) {
     functions.logger.warn("getZodiacFortune text fallback", {
       code: "ZODIAC_FORTUNE_TEXT_FALLBACK",
@@ -988,37 +1284,139 @@ const createZodiacPayload = async (
     });
     return {
       isFallback: true,
-      payload: {date: dateKey, dayPillar, lines: fallbackLines},
+      payload: {
+        date: dateKey,
+        dayPillar,
+        lines: fallbackLines,
+        today: {
+          summary: DEFAULT_SUMMARY,
+          scores,
+          question,
+          questionTeaser: DEFAULT_QUESTION_TEASER,
+        },
+      },
     };
   }
 };
 
+/**
+ * 오늘의 띠별·공통 운세를 캐시에서 꺼내거나, 없으면 만들어 저장한다.
+ * @param {!OpenAI} client OpenAI 클라이언트.
+ * @param {string} dateKey KST 기준 오늘 날짜.
+ * @param {string} dayPillar 오늘의 일진(없으면 빈 문자열).
+ * @return {!Promise<!ZodiacFortunePayload>} 오늘의 띠별·공통 운세.
+ */
+const getOrCreateZodiac = async (
+  client: OpenAI,
+  dateKey: string,
+  dayPillar: string,
+): Promise<ZodiacFortunePayload> => {
+  const ref = db().collection("zodiacFortune").doc(dateKey);
+  const snapshot = await ref.get();
+  const cached = snapshot.exists ?
+    (snapshot.data() as ZodiacFortunePayload) : null;
+  // 공통 오늘의 운세·오늘의 질문이 생기기 전에 저장된 캐시는 다시 만든다.
+  if (cached?.today?.questionTeaser) return cached;
+
+  const {payload, isFallback} = await createZodiacPayload(
+    client, dateKey, dayPillar,
+  );
+  if (!isFallback) {
+    await ref.set(payload);
+  }
+  return payload;
+};
+
 export const getZodiacFortune = onCall(
   {region: "asia-northeast3"},
-  async (request): Promise<ZodiacFortunePayload> => {
-    const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-    if (!OPENAI_API_KEY) {
+  async (
+    request,
+  ): Promise<ZodiacFortunePayload & {weekly: CommonWeeklyFortune}> => {
+    const openai = openAiClient();
+    if (!openai) {
       throw new functions.https.HttpsError(
         "internal", "OPENAI_API_KEY is not set.",
       );
     }
-    if (!openai) {
-      openai = new OpenAI({apiKey: OPENAI_API_KEY});
-    }
 
-    const dateKey = getKstDateKey(new Date());
-    const ref = db().collection("zodiacFortune").doc(dateKey);
-    const snapshot = await ref.get();
-    if (snapshot.exists) return snapshot.data() as ZodiacFortunePayload;
-
+    const now = new Date();
     const data = request.data as {dayPillar?: unknown} | undefined;
     const dayPillar = sanitizeDayPillar(data?.dayPillar);
-    const {payload, isFallback} = await createZodiacPayload(
-      openai, dateKey, dayPillar,
-    );
-    if (!isFallback) {
-      await ref.set(payload);
+    const [zodiac, weekly] = await Promise.all([
+      getOrCreateZodiac(openai, getKstDateKey(now), dayPillar),
+      getOrCreateCommonWeekly(openai, getIsoWeekKey(now)),
+    ]);
+    return {...zodiac, weekly};
+  },
+);
+
+/**
+ * KST 날짜(yyyy-mm-dd)에서 며칠 전 날짜를 구한다.
+ * @param {string} dateKey 기준 날짜.
+ * @param {number} days 뺄 일수.
+ * @return {string} yyyy-mm-dd.
+ */
+const daysBefore = (dateKey: string, days: number): string => {
+  const [y, m, d] = dateKey.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d - days)).toISOString().slice(0, 10);
+};
+
+// 매일 0시 1분(KST)에 그날 운세를 미리 만든다. 공통 운세(미등록자)와,
+// 최근 7일 안에 운세를 본 사주의 오늘·이번 주 운세. 이미 캐시가 있으면
+// 그대로 둔다(getOrCreate*).
+export const prewarmFortunes = onSchedule(
+  {
+    schedule: "1 0 * * *",
+    timeZone: "Asia/Seoul",
+    region: "asia-northeast3",
+    timeoutSeconds: 540,
+  },
+  async () => {
+    const client = openAiClient();
+    if (!client) {
+      functions.logger.error("prewarm skipped: OPENAI_API_KEY is not set.");
+      return;
     }
-    return payload;
+
+    const now = new Date();
+    const dateKey = getKstDateKey(now);
+    const isoWeek = getIsoWeekKey(now);
+    const dayPillar = dayPillarOf(dateKey);
+
+    await Promise.all([
+      getOrCreateZodiac(client, dateKey, dayPillar),
+      getOrCreateCommonWeekly(client, isoWeek),
+    ]);
+
+    const snapshot = await db().collection(PREWARM_COLLECTION)
+      .where("lastSeen", ">=", daysBefore(dateKey, PREWARM_ACTIVE_DAYS))
+      .get();
+    let failed = 0;
+    const docs = snapshot.docs;
+    for (let i = 0; i < docs.length; i += PREWARM_CONCURRENCY) {
+      await Promise.all(docs.slice(i, i + PREWARM_CONCURRENCY).map(
+        async (doc) => {
+          const manse = doc.data().manse;
+          if (!isManseLike(manse)) return;
+          try {
+            await Promise.all([
+              getOrCreateDaily(client, manse, doc.id, dateKey, dayPillar),
+              getOrCreateWeekly(client, manse, doc.id, isoWeek),
+            ]);
+          } catch (error) {
+            failed++;
+            functions.logger.warn("prewarm user failed", {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        },
+      ));
+    }
+    functions.logger.info("prewarm done", {
+      code: "FORTUNE_PREWARM_DONE",
+      dateKey,
+      users: docs.length,
+      failed,
+    });
   },
 );
